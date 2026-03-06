@@ -115,8 +115,10 @@ const authPanels = {
   register: document.getElementById("register-panel"),
 };
 const registerPasswordConfirmInput = document.getElementById("register-password-confirm");
+const HOME_PAGE = "home.html";
 const firebaseConfig = window.FIREBASE_CONFIG;
 let firebaseAuth = null;
+let firebaseDb = null;
 
 if (
   window.firebase &&
@@ -129,6 +131,19 @@ if (
       window.firebase.initializeApp(firebaseConfig);
     }
     firebaseAuth = window.firebase.auth();
+    firebaseDb = window.firebase.firestore ? window.firebase.firestore() : null;
+
+    firebaseAuth.onAuthStateChanged(async (user) => {
+      if (!user) {
+        return;
+      }
+
+      await user.reload();
+
+      if (user.emailVerified && !window.location.pathname.endsWith("/home.html")) {
+        window.location.href = HOME_PAGE;
+      }
+    });
   } catch (error) {
     console.error("Error inicializando Firebase:", error);
   }
@@ -194,6 +209,8 @@ const mapAuthError = (error) => {
       return "Demasiados intentos. Intenta de nuevo en unos minutos.";
     case "auth/user-disabled":
       return "Esta cuenta fue deshabilitada.";
+    case "permission-denied":
+      return "Firestore rechazo el guardado. Revisa las reglas de seguridad.";
     default:
       return `No se pudo completar la accion. ${error?.message || "Intenta nuevamente."}`;
   }
@@ -207,6 +224,32 @@ const withLoadingState = (form, isLoading) => {
   form.querySelectorAll("input, button").forEach((element) => {
     element.disabled = isLoading;
   });
+};
+
+const upsertUserProfile = async (user, fullName = "") => {
+  if (!firebaseDb || !user) {
+    return;
+  }
+
+  const userRef = firebaseDb.collection("users").doc(user.uid);
+  const snapshot = await userRef.get();
+  const now = window.firebase.firestore.FieldValue.serverTimestamp();
+
+  const payload = {
+    uid: user.uid,
+    email: user.email || "",
+    fullName: fullName || user.displayName || "",
+    emailVerified: Boolean(user.emailVerified),
+    lastLoginAt: now,
+    provider: "password",
+    updatedAt: now,
+  };
+
+  if (!snapshot.exists) {
+    payload.createdAt = now;
+  }
+
+  await userRef.set(payload, { merge: true });
 };
 
 const setAuthTab = (tabName) => {
@@ -303,9 +346,24 @@ loginForm?.addEventListener("submit", async (event) => {
 
   try {
     withLoadingState(loginForm, true);
-    await firebaseAuth.signInWithEmailAndPassword(email, password);
-    setFeedback(loginFeedback, "Inicio de sesion exitoso.", "success");
-    closeAuthModal();
+    const credentials = await firebaseAuth.signInWithEmailAndPassword(email, password);
+    const user = credentials.user;
+    await user.reload();
+
+    if (!user.emailVerified) {
+      await user.sendEmailVerification();
+      await firebaseAuth.signOut();
+      setFeedback(
+        loginFeedback,
+        "Tu correo aun no esta verificado. Te reenviamos un correo de verificacion. Revisa bandeja y spam.",
+        "error"
+      );
+      return;
+    }
+
+    await upsertUserProfile(user);
+    setFeedback(loginFeedback, "Inicio de sesion exitoso. Redirigiendo...", "success");
+    window.location.href = HOME_PAGE;
   } catch (error) {
     setFeedback(loginFeedback, mapAuthError(error), "error");
   } finally {
@@ -348,13 +406,26 @@ registerForm?.addEventListener("submit", async (event) => {
   try {
     withLoadingState(registerForm, true);
     const credentials = await firebaseAuth.createUserWithEmailAndPassword(email, password);
+    const user = credentials.user;
 
-    if (credentials.user && name) {
-      await credentials.user.updateProfile({ displayName: name });
+    if (user && name) {
+      await user.updateProfile({ displayName: name });
     }
 
-    setFeedback(registerFeedback, "Cuenta creada correctamente.", "success");
-    closeAuthModal();
+    if (user) {
+      await upsertUserProfile(user, name);
+      await user.sendEmailVerification();
+      await firebaseAuth.signOut();
+    }
+
+    setFeedback(
+      registerFeedback,
+      "Cuenta creada. Te enviamos un correo de verificacion. Verificalo antes de iniciar sesion.",
+      "success"
+    );
+    registerForm.reset();
+    setAuthTab("login");
+    setFeedback(loginFeedback, "Primero verifica tu correo y luego inicia sesion.", "info");
   } catch (error) {
     setFeedback(registerFeedback, mapAuthError(error), "error");
   } finally {
